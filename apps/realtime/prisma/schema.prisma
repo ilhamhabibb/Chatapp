@@ -1,0 +1,194 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+enum ConversationType {
+  PRIVATE
+  PUBLIC
+}
+
+enum ConversationRole {
+  OWNER
+  MODERATOR
+  MEMBER
+}
+
+enum MessageKind {
+  TEXT
+  SYSTEM
+}
+
+enum GameRoomStatus {
+  WAITING
+  COUNTDOWN
+  PLAYING
+  FINISHED
+  CLOSED
+}
+
+enum ParticipantStatus {
+  ACTIVE
+  LEFT
+  DISCONNECTED
+}
+
+enum GameMatchStatus {
+  ACTIVE
+  FINISHED
+  ABORTED
+}
+
+model User {
+  id               String            @id @default(uuid()) @db.Uuid
+  email            String            @unique @db.VarChar(320)
+  username         String            @unique @db.VarChar(32)
+  displayName      String            @db.VarChar(80)
+  passwordHash     String            @db.Text
+  avatarUrl        String?           @db.Text
+  emailVerifiedAt  DateTime?
+  lastSeenAt       DateTime?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  authTokens       AuthToken[]
+  conversations    Conversation[]    @relation("ConversationOwner")
+  memberships      ConversationMember[]
+  messages         Message[]
+  hostedRooms      GameRoom[]         @relation("GameRoomHost")
+  gameParticipants GameParticipant[]
+  gameResults      GameResult[]
+}
+
+model AuthToken {
+  id        String       @id @default(uuid()) @db.Uuid
+  userId    String       @db.Uuid
+  type      AuthTokenType
+  tokenHash String       @unique @db.Text
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime     @default(now())
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+}
+
+model Conversation {
+  id          String              @id @default(uuid()) @db.Uuid
+  type        ConversationType
+  name        String?             @db.VarChar(80)
+  description String?             @db.Text
+  ownerId     String?             @db.Uuid
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  owner       User?               @relation("ConversationOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  members     ConversationMember[]
+  messages    Message[]
+
+  @@index([type, updatedAt])
+  @@index([ownerId])
+}
+
+model ConversationMember {
+  id                 String           @id @default(uuid()) @db.Uuid
+  conversationId     String           @db.Uuid
+  userId             String           @db.Uuid
+  role               ConversationRole @default(MEMBER)
+  joinedAt           DateTime         @default(now())
+  lastReadMessageId  String?          @db.Uuid
+  conversation       Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+  @@index([userId, joinedAt])
+}
+
+model Message {
+  id              String           @id @default(uuid()) @db.Uuid
+  conversationId  String           @db.Uuid
+  senderId        String           @db.Uuid
+  clientMessageId String           @db.Uuid
+  body            String           @db.Text
+  kind            MessageKind      @default(TEXT)
+  createdAt       DateTime         @default(now())
+  editedAt        DateTime?
+  deletedAt       DateTime?
+  conversation    Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender          User             @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, senderId, clientMessageId])
+  @@index([conversationId, createdAt, id])
+  @@index([senderId, createdAt])
+}
+
+model GameRoom {
+  id                    String          @id @default(uuid()) @db.Uuid
+  code                  String          @unique @db.VarChar(12)
+  hostId                String          @db.Uuid
+  status                GameRoomStatus  @default(WAITING)
+  maxPlayers            Int             @default(4)
+  roundDurationSeconds  Int             @default(90)
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
+  finishedAt            DateTime?
+  host                  User            @relation("GameRoomHost", fields: [hostId], references: [id], onDelete: Cascade)
+  participants          GameParticipant[]
+  matches               GameMatch[]
+
+  @@index([status, createdAt])
+  @@index([hostId])
+}
+
+model GameParticipant {
+  id          String             @id @default(uuid()) @db.Uuid
+  gameRoomId  String             @db.Uuid
+  userId      String             @db.Uuid
+  ready       Boolean            @default(false)
+  status      ParticipantStatus  @default(ACTIVE)
+  joinedAt    DateTime           @default(now())
+  lastSeenAt  DateTime           @default(now())
+  gameRoom    GameRoom           @relation(fields: [gameRoomId], references: [id], onDelete: Cascade)
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([gameRoomId, userId])
+  @@index([userId, status])
+}
+
+model GameMatch {
+  id          String          @id @default(uuid()) @db.Uuid
+  createdAt   DateTime        @default(now())
+  gameRoomId  String          @db.Uuid
+  status      GameMatchStatus @default(ACTIVE)
+  startedAt   DateTime?
+  endedAt     DateTime?
+  seed        String?         @db.Text
+  durationMs  Int?
+  gameRoom    GameRoom        @relation(fields: [gameRoomId], references: [id], onDelete: Cascade)
+  results     GameResult[]
+
+  @@index([gameRoomId, createdAt])
+}
+
+model GameResult {
+  id                String    @id @default(uuid()) @db.Uuid
+  matchId           String    @db.Uuid
+  userId            String    @db.Uuid
+  score             Int       @default(0)
+  rank              Int
+  tokensCollected   Int       @default(0)
+  survivalTimeMs    Int       @default(0)
+  match             GameMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, userId])
+  @@index([userId, score])
+}
