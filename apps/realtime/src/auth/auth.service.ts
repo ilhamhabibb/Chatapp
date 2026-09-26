@@ -25,6 +25,14 @@ interface AuthResult {
   devVerificationToken?: string;
 }
 
+/**
+ * A real argon2id hash of an unguessable value. Verifying against it when the
+ * email is unknown keeps the failure path's cost equal to the success path, so
+ * response timing does not reveal whether an account exists.
+ */
+const DUMMY_PASSWORD_HASH =
+  "$argon2id$v=19$m=65536,p=4,t=3$H1vmTZfRM9ctchyx/10QHQ$/zy4KtBdxO8vt33WLuAKHQSaHga4jWuGZvomb43JYg0";
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -68,7 +76,13 @@ export class AuthService {
     }
 
     const user = await this.prisma.$transaction(async (tx) => {
-      await tx.authToken.update({ where: { id: tokenRecord.id }, data: { usedAt: new Date() } });
+      const claimed = await tx.authToken.updateMany({
+        where: { id: tokenRecord.id, usedAt: null, expiresAt: { gt: new Date() } },
+        data: { usedAt: new Date() },
+      });
+      if (claimed.count !== 1) {
+        throw new UnauthorizedException("Token verifikasi tidak valid");
+      }
       return tx.user.update({ where: { id: tokenRecord.userId }, data: { emailVerifiedAt: new Date() } });
     });
     return this.toAuthUser(user);
@@ -76,7 +90,11 @@ export class AuthService {
 
   async login(input: LoginInput): Promise<AuthResult> {
     const user = await this.prisma.user.findUnique({ where: { email: input.email } });
-    if (!user || !(await argon2.verify(user.passwordHash, input.password))) {
+    // Verify against a throwaway hash when the account is unknown, otherwise the
+    // missing-argon2-work timing difference confirms whether the email exists.
+    const hash = user?.passwordHash ?? DUMMY_PASSWORD_HASH;
+    const passwordMatches = await argon2.verify(hash, input.password);
+    if (!user || !passwordMatches) {
       throw new UnauthorizedException("Email atau password salah");
     }
     if (!user.emailVerifiedAt) {
@@ -100,17 +118,36 @@ export class AuthService {
       throw new UnauthorizedException("Token reset tidak valid");
     }
     const passwordHash = await argon2.hash(input.password);
-    await this.prisma.$transaction([
-      this.prisma.authToken.update({ where: { id: tokenRecord.id }, data: { usedAt: new Date() } }),
-      this.prisma.user.update({ where: { id: tokenRecord.userId }, data: { passwordHash } }),
-    ]);
+    await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.authToken.updateMany({
+        where: { id: tokenRecord.id, usedAt: null, expiresAt: { gt: new Date() } },
+        data: { usedAt: new Date() },
+      });
+      if (claimed.count !== 1) {
+        throw new UnauthorizedException("Token reset tidak valid");
+      }
+      await tx.user.update({ where: { id: tokenRecord.userId }, data: { passwordHash } });
+    });
+    // A reset triggered by a compromise must also evict the attacker's session.
+    await this.revokeUserSessions(tokenRecord.userId);
   }
 
   async createSession(userId: string): Promise<SessionResult> {
     const token = randomBytes(32).toString("base64url");
     const expiresIn = this.config.getOrThrow<number>("SESSION_TTL_SECONDS");
     await this.redis.set(this.sessionKey(token), userId, expiresIn);
+    await this.redis.addToSet(this.sessionIndexKey(userId), this.sessionKey(token), expiresIn);
     return { token, expiresIn };
+  }
+
+  /** Drops every session belonging to a user, e.g. after a password reset. */
+  async revokeUserSessions(userId: string): Promise<void> {
+    const indexKey = this.sessionIndexKey(userId);
+    const keys = await this.redis.membersOfSet(indexKey);
+    if (keys.length > 0) {
+      await this.redis.deleteMany(keys);
+    }
+    await this.redis.deleteSet(indexKey);
   }
 
   async resolveSession(token: string): Promise<AuthUser | null> {
@@ -127,7 +164,12 @@ export class AuthService {
   }
 
   async destroySession(token: string): Promise<void> {
-    await this.redis.delete(this.sessionKey(token));
+    const key = this.sessionKey(token);
+    const userId = await this.redis.get(key);
+    await this.redis.delete(key);
+    if (userId) {
+      await this.redis.removeFromSet(this.sessionIndexKey(userId), key);
+    }
   }
 
   async getUser(userId: string): Promise<AuthUser> {
@@ -157,6 +199,10 @@ export class AuthService {
 
   private sessionKey(token: string): string {
     return `session:${createHash("sha256").update(token).digest("hex")}`;
+  }
+
+  private sessionIndexKey(userId: string): string {
+    return `sessions:user:${userId}`;
   }
 
   private toAuthUser(user: {

@@ -1,10 +1,12 @@
-import { Body, Controller, Get, Post, Req, Res, UseGuards } from "@nestjs/common";
+import { Body, Controller, Get, Inject, Post, Req, Res, UseGuards } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 import { serialize } from "cookie";
 import type { FastifyReply } from "fastify";
 import { AuthUser } from "../common/auth-user";
 import { readSessionCookie } from "../common/session-cookie";
 import { success } from "../common/http/response";
 import { parseInput } from "../common/validation";
+import { isCookieSecure, type AppConfig } from "../config/env";
 import { AuthenticatedRequest, AuthGuard } from "./auth.guard";
 import { AuthService } from "./auth.service";
 import { forgotPasswordSchema, loginSchema, registerSchema, resetPasswordSchema, verifyEmailSchema } from "./auth.schemas";
@@ -15,7 +17,27 @@ export class AuthController {
   constructor(
     private readonly auth: AuthService,
     private readonly session: SessionService,
+    @Inject(ConfigService) private readonly config: ConfigService<AppConfig, true>,
   ) {}
+
+  /**
+   * Single source of truth for the session cookie. Login, logout and any future
+   * refresh path must agree on `httpOnly`/`sameSite`/`secure`; duplicating the
+   * literal is how a logout cookie silently ends up weaker than the login one.
+   */
+  private writeSessionCookie(reply: FastifyReply, value: string, maxAge: number): void {
+    reply.header(
+      "Set-Cookie",
+      serialize(this.session.createCookieName(), value, {
+        httpOnly: true,
+        secure: isCookieSecure(this.config.get("NODE_ENV"), this.config.get("COOKIE_SECURE")),
+        sameSite: "lax",
+        path: "/",
+        maxAge,
+        ...(maxAge === 0 ? { expires: new Date(0) } : {}),
+      }),
+    );
+  }
 
   @Post("register")
   async register(@Body() body: unknown) {
@@ -35,7 +57,7 @@ export class AuthController {
     if (!result.session) {
       throw new Error("Session tidak dibuat");
     }
-    this.setSessionCookie(reply, result.session.token, result.session.expiresIn);
+    this.writeSessionCookie(reply, result.session.token, result.session.expiresIn);
     return success({ user: result.user }, "Login berhasil");
   }
 
@@ -46,7 +68,7 @@ export class AuthController {
     if (token) {
       await this.auth.destroySession(token);
     }
-    reply.header("Set-Cookie", serialize(this.session.createCookieName(), "", { httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax", path: "/", maxAge: 0, expires: new Date(0) }));
+    this.writeSessionCookie(reply, "", 0);
     return success(null, "Logout berhasil");
   }
 
@@ -69,14 +91,4 @@ export class AuthController {
     return success(user);
   }
 
-  private setSessionCookie(reply: FastifyReply, token: string, expiresIn: number): void {
-    const secure = process.env.NODE_ENV === "production";
-    reply.header("Set-Cookie", serialize(this.session.createCookieName(), token, {
-      httpOnly: true,
-      secure,
-      sameSite: "lax",
-      path: "/",
-      maxAge: expiresIn,
-    }));
-  }
 }

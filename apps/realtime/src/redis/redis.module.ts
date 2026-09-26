@@ -33,6 +33,30 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     await this.client.del(key);
   }
 
+  async deleteMany(keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    await this.client.del(...keys);
+  }
+
+  async addToSet(key: string, member: string, ttlSeconds: number): Promise<void> {
+    const transaction = this.client.multi();
+    transaction.sadd(key, member);
+    transaction.expire(key, ttlSeconds);
+    await transaction.exec();
+  }
+
+  async removeFromSet(key: string, member: string): Promise<void> {
+    await this.client.srem(key, member);
+  }
+
+  async membersOfSet(key: string): Promise<string[]> {
+    return this.client.smembers(key);
+  }
+
+  async deleteSet(key: string): Promise<void> {
+    await this.client.del(key);
+  }
+
   async addPresence(userId: string, connectionId: string, ttlSeconds: number): Promise<number> {
     const key = this.presenceKey(userId);
     const now = Date.now();

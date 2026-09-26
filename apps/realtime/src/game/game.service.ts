@@ -55,11 +55,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     return toGameState(room);
   }
 
-  async getState(code: string, _userId: string): Promise<GameState> {
-    await this.requireRoom(code);
+  async getState(code: string, userId: string): Promise<GameState> {
+    const record = await this.assertParticipant(code, userId);
     const room = this.rooms.get(code);
     if (!room) {
-      const record = await this.requireRoom(code);
       const created = createInitialRoomState(record.id, record.code, record.hostId, record.roundDurationSeconds);
       this.rooms.set(code, created);
       this.syncPlayers(created, record);
@@ -104,6 +103,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     return toGameState(room);
   }
 
+  // No DB check here on purpose: this runs per input event (~60Hz per player).
+  // The in-memory `players` map is the authorization gate for a live room.
   async setInput(code: string, userId: string, x: number, y: number, sequence: number): Promise<void> {
     const room = this.rooms.get(code);
     if (!room || room.status !== GameRoomStatus.PLAYING) {
@@ -220,7 +221,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const active = record.participants.filter((participant) => participant.status === ParticipantStatus.ACTIVE);
     for (const participant of active) {
       const current = room.players.get(participant.userId);
-      room.players.set(participant.userId, current ?? {
+      if (current) {
+        current.ready = participant.ready;
+        current.connected = true;
+        continue;
+      }
+      room.players.set(participant.userId, {
         id: participant.userId,
         username: participant.user.username,
         displayName: participant.user.displayName,

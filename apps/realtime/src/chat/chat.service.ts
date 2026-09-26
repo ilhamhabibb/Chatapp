@@ -102,11 +102,11 @@ export class ChatService {
     await this.repository.addMember(conversationId, memberId);
   }
 
-  async removeMember(userId: string, conversationId: string, memberId: string): Promise<void> {
+  async removeMember(userId: string, conversationId: string, memberId: string): Promise<string> {
     const conversation = await this.requireConversation(userId, conversationId);
     if (userId === memberId) {
       await this.repository.removeMember(conversationId, memberId);
-      return;
+      return memberId;
     }
     if (conversation.type !== "PUBLIC") {
       throw new ForbiddenException("Hanya anggota yang dapat keluar dari private chat");
@@ -120,6 +120,7 @@ export class ChatService {
       throw new ForbiddenException("Owner room tidak dapat dihapus");
     }
     await this.repository.removeMember(conversationId, memberId);
+    return memberId;
   }
 
   async markRead(userId: string, conversationId: string, messageId?: string): Promise<void> {
@@ -158,9 +159,11 @@ export class ChatService {
 
   private async mapConversation(record: ConversationRecord, userId: string): Promise<ConversationSummary> {
     const member = record.members.find((item) => item.userId === userId);
-    const [lastMessage, unreadCount] = await Promise.all([
+    const peerMember = record.type === "PRIVATE" ? record.members.find((item) => item.userId !== userId) : undefined;
+    const [lastMessage, unreadCount, peer] = await Promise.all([
       record.messages[0] ? this.mapMessage(record.messages[0]) : null,
       member ? this.repository.countUnread(record.id, userId, member.lastReadMessageId) : Promise.resolve(0),
+      peerMember ? this.mapUser(peerMember.user) : Promise.resolve(null),
     ]);
     return {
       id: record.id,
@@ -171,6 +174,7 @@ export class ChatService {
       lastMessage,
       unreadCount,
       memberCount: record._count.members,
+      peer,
     };
   }
 

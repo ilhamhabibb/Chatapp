@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, Param, Post, Query, Req, UseGuards } fro
 import { AuthenticatedRequest, AuthGuard } from "../auth/auth.guard";
 import { success } from "../common/http/response";
 import { parseInput } from "../common/validation";
+import { ChatGateway } from "./chat.gateway";
 import { ChatService } from "./chat.service";
 import {
   conversationMemberParamsSchema,
@@ -15,7 +16,10 @@ import {
 @Controller("api/conversations")
 @UseGuards(AuthGuard)
 export class ChatController {
-  constructor(private readonly chat: ChatService) {}
+  constructor(
+    private readonly chat: ChatService,
+    private readonly gateway: ChatGateway,
+  ) {}
 
   @Get()
   async list(@Req() request: AuthenticatedRequest) {
@@ -76,7 +80,8 @@ export class ChatController {
   @Delete(":conversationId/members/:userId")
   async removeMember(@Req() request: AuthenticatedRequest, @Param() params: unknown) {
     const { conversationId, userId } = parseInput(conversationMemberParamsSchema, params);
-    await this.chat.removeMember(request.user!.id, conversationId, userId);
+    const removedId = await this.chat.removeMember(request.user!.id, conversationId, userId);
+    await this.gateway.evictFromConversation(conversationId, removedId);
     return success(null, "Anggota berhasil dihapus");
   }
 }

@@ -36,6 +36,7 @@ export interface ConversationSummary {
   lastMessage: Message | null;
   unreadCount: number;
   memberCount: number;
+  peer: PublicUser | null;
 }
 
 export interface Message {

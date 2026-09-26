@@ -5,7 +5,7 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "dev": "tsx watch src/main.ts",
+    "dev": "tsc -p tsconfig.build.json && concurrently -k -n tsc,app -c gray,green \"tsc -p tsconfig.build.json --watch --preserveWatchOutput\" \"node --watch dist/main.js\"",
     "start": "node dist/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
@@ -37,5 +37,8 @@
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^5.0.1"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
   }
 }

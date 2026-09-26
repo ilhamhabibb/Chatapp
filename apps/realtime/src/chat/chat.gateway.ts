@@ -1,8 +1,10 @@
+import { HttpException, Logger, UnauthorizedException } from "@nestjs/common";
 import { ConnectedSocket, MessageBody, SubscribeMessage, WebSocketGateway, WebSocketServer } from "@nestjs/websockets";
 import type { Namespace, Socket } from "socket.io";
+import { ZodError } from "zod";
 import { CHAT_NAMESPACE } from "@chating/contracts";
+import { gatewayOriginChecker } from "../config/env";
 import { AuthUser } from "../common/auth-user";
-import { readSessionCookie } from "../common/session-cookie";
 import { getValidationMessage, parseInput } from "../common/validation";
 import { SessionService } from "../auth/session.service";
 import { RedisService } from "../redis/redis.module";
@@ -12,9 +14,11 @@ import { messageSendSchema, readSchema, typingSchema } from "./chat.schemas";
 
 @WebSocketGateway({
   namespace: CHAT_NAMESPACE,
-  cors: { origin: process.env.WEB_ORIGIN?.split(",") ?? ["http://localhost:3000"], credentials: true },
+  cors: { origin: gatewayOriginChecker(), credentials: true },
 })
 export class ChatGateway {
+  private readonly logger = new Logger("ChatGateway");
+
   @WebSocketServer()
   private server!: Namespace;
 
@@ -28,7 +32,11 @@ export class ChatGateway {
   ) {}
 
   async handleConnection(client: Socket): Promise<void> {
-    const user = await this.session.resolveFromCookie(readSessionCookie(client.handshake.headers.cookie, this.session.createCookieName()));
+    // See GameGateway: keep the pending session on the socket so handlers that
+    // run before this resolves can await it rather than see a missing user.
+    const pending = this.session.resolveFromCookie(client.handshake.headers.cookie);
+    client.data.auth = pending;
+    const user = await pending;
     if (!user) {
       client.disconnect(true);
       return;
@@ -66,7 +74,7 @@ export class ChatGateway {
   async join(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
     return this.run(async () => {
       const input = parseInput(typingSchema, body);
-      const user = this.getUser(client);
+      const user = await this.getUser(client);
       await this.chat.assertMember(user.id, input.conversationId);
       const room = this.conversationRoom(input.conversationId);
       const previousRooms = Array.from(client.rooms).filter((value) => value.startsWith("conversation:") && value !== room);
@@ -81,7 +89,7 @@ export class ChatGateway {
   async send(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
     return this.run(async () => {
       const input = parseInput(messageSendSchema, body);
-      const user = this.getUser(client);
+      const user = await this.getUser(client);
       const message = await this.chat.sendMessage(user.id, input);
       this.server.to(this.conversationRoom(input.conversationId)).emit("message.created", message);
       return message;
@@ -92,7 +100,7 @@ export class ChatGateway {
   async typingStart(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
     return this.run(async () => {
       const input = parseInput(typingSchema, body);
-      const user = this.getUser(client);
+      const user = await this.getUser(client);
       await this.chat.assertMember(user.id, input.conversationId);
       const room = this.conversationRoom(input.conversationId);
       const timers = this.typingTimers.get(room) ?? new Map<string, ReturnType<typeof setTimeout>>();
@@ -114,7 +122,7 @@ export class ChatGateway {
   async typingStop(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
     return this.run(async () => {
       const input = parseInput(typingSchema, body);
-      const user = this.getUser(client);
+      const user = await this.getUser(client);
       await this.chat.assertMember(user.id, input.conversationId);
       const room = this.conversationRoom(input.conversationId);
       const timers = this.typingTimers.get(room);
@@ -132,7 +140,7 @@ export class ChatGateway {
   async read(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
     return this.run(async () => {
       const input = parseInput(readSchema, body);
-      const user = this.getUser(client);
+      const user = await this.getUser(client);
       await this.chat.markRead(user.id, input.conversationId, input.messageId);
       this.server.to(this.conversationRoom(input.conversationId)).emit("message.read", { conversationId: input.conversationId, userId: user.id, messageId: input.messageId ?? null });
       return { read: true };
@@ -148,6 +156,17 @@ export class ChatGateway {
     }
   }
 
+  /**
+   * A removed member must stop receiving live traffic immediately. The REST
+   * history is already blocked by `requireMember`, but the socket room is
+   * independent, so an open tab would otherwise keep streaming messages.
+   */
+  async evictFromConversation(conversationId: string, memberId: string): Promise<void> {
+    const room = this.conversationRoom(conversationId);
+    await this.server.in(room).socketsLeave(this.userRoom(memberId));
+    this.server.to(room).emit("conversation.member.removed", { conversationId, userId: memberId });
+  }
+
   private conversationRoom(conversationId: string): string {
     return `conversation:${conversationId}`;
   }
@@ -156,10 +175,11 @@ export class ChatGateway {
     return `user:${userId}`;
   }
 
-  private getUser(client: Socket): AuthUser {
-    const user = client.data.user as AuthUser | undefined;
+  private async getUser(client: Socket): Promise<AuthUser> {
+    const pending = client.data.auth as Promise<AuthUser | null> | undefined;
+    const user = (await pending) ?? (client.data.user as AuthUser | undefined);
     if (!user) {
-      throw new Error("Sesi tidak valid");
+      throw new UnauthorizedException("Sesi tidak valid");
     }
     return user;
   }
@@ -168,6 +188,13 @@ export class ChatGateway {
     try {
       return { success: true, data: await action() };
     } catch (error) {
+      // Zod/HTTP failures are ordinary client mistakes and already surface a
+      // safe message, so keep them out of the error log with their stack dump.
+      if (error instanceof ZodError || error instanceof HttpException) {
+        this.logger.warn(`socket handler ditolak: ${getValidationMessage(error)}`);
+      } else {
+        this.logger.error(`socket handler gagal: ${error instanceof Error ? error.stack : String(error)}`);
+      }
       return { success: false, error: { code: "CHAT_ERROR", message: getValidationMessage(error) } };
     }
   }
